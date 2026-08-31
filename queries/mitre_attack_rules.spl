@@ -1,0 +1,55 @@
+# ==============================================================================
+# Splunk Enterprise SOC Detection Rules — AWS CloudTrail & VPC Flow Logs
+# Mapped to MITRE ATT&CK Framework
+# Author: Parth Pandey (@ParthPandey25)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. T1110 - Brute Force / Excessive Console Login Failures
+# Description: Detects multiple failed AWS Console login attempts from a single IP.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName=ConsoleLogin "errorMessage=Failed authentication"
+| bin _time span=5m
+| stats count as failed_attempts, values(userIdentity.userName) as targeted_users, values(userAgent) as user_agents by sourceIPAddress, _time
+| where failed_attempts >= 5
+| eval alert_severity="HIGH", mitre_technique="T1110 - Brute Force"
+| sort - failed_attempts
+
+# ------------------------------------------------------------------------------
+# 2. T1078 - Valid Accounts / Unauthorized Console Login Without MFA
+# Description: Flags successful console logins using root or admin without MFA token.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName=ConsoleLogin "responseElements.ConsoleLogin=Success"
+| where 'additionalEventData.MFAUsed'="No" OR 'userIdentity.type'="Root"
+| table _time, userIdentity.type, userIdentity.arn, sourceIPAddress, awsRegion, additionalEventData.MFAUsed
+| eval alert_severity=if('userIdentity.type'=="Root", "CRITICAL", "MEDIUM")
+| eval mitre_technique="T1078 - Valid Accounts"
+
+# ------------------------------------------------------------------------------
+# 3. T1098 - Account Manipulation / IAM Policy Modification
+# Description: Detects creation or attachment of permissive administrator policies.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("AttachUserPolicy", "AttachRolePolicy", "PutUserPolicy", "PutRolePolicy", "CreatePolicyVersion")
+| search requestParameters.policyArn="*AdministratorAccess*" OR requestParameters.policyDocument="*\"Action\": \"*\"*"
+| table _time, userIdentity.arn, eventName, requestParameters.userName, requestParameters.roleName, requestParameters.policyArn, sourceIPAddress
+| eval alert_severity="CRITICAL", mitre_technique="T1098 - Account Manipulation"
+
+# ------------------------------------------------------------------------------
+# 4. T1530 - Data from Cloud Storage Object / S3 Public Exposure Alert
+# Description: Alerts on S3 bucket ACL or policy changes granting public read/write.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("PutBucketAcl", "PutBucketPolicy", "PutBucketPublicAccessBlock", "DeleteBucketPublicAccessBlock")
+| search requestParameters.PublicAccessBlockConfiguration.BlockPublicAcls=false OR requestParameters.PublicAccessBlockConfiguration.BlockPublicPolicy=false
+| table _time, userIdentity.principalId, eventName, requestParameters.bucketName, sourceIPAddress, userAgent
+| eval alert_severity="HIGH", mitre_technique="T1530 - Cloud Storage Discovery"
+
+# ------------------------------------------------------------------------------
+# 5. T1046 - Network Service Scanning / Port Scan Detection via VPC Flow Logs
+# Description: Identifies single source IP communicating with >25 unique destination ports.
+# ------------------------------------------------------------------------------
+index=aws_vpc_flow action=REJECT
+| bin _time span=10m
+| stats dc(dest_port) as distinct_ports, count as reject_count by src_ip, dest_ip, _time
+| where distinct_ports >= 25
+| eval alert_severity="MEDIUM", mitre_technique="T1046 - Network Service Scanning"
+| sort - distinct_ports

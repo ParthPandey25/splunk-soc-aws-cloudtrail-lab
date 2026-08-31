@@ -1,0 +1,74 @@
+<dashboard version="1.1" theme="dark">
+  <label>Cloud SOC Analyst Incident Monitoring Dashboard</label>
+  <description>Real-time threat detection for AWS CloudTrail &amp; VPC Flow Logs mapped to MITRE ATT&amp;CK</description>
+  
+  <row>
+    <panel>
+      <single>
+        <title>Failed Console Logins (Last 24h)</title>
+        <search>
+          <query>index=aws_cloudtrail eventName=ConsoleLogin "errorMessage=Failed authentication" | stats count</query>
+          <earliest>-24h@h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xf8be34","0xdc4e41"]</option>
+        <option name="rangeValues">[5,20]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Root Account Logins Without MFA</title>
+        <search>
+          <query>index=aws_cloudtrail eventName=ConsoleLogin "responseElements.ConsoleLogin=Success" 'userIdentity.type'="Root" | stats count</query>
+          <earliest>-24h@h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="rangeValues">[1]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Privilege Escalation Events</title>
+        <search>
+          <query>index=aws_cloudtrail eventName IN ("AttachUserPolicy", "AttachRolePolicy") requestParameters.policyArn="*AdministratorAccess*" | stats count</query>
+          <earliest>-24h@h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="rangeValues">[1]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+  </row>
+
+  <row>
+    <panel>
+      <table>
+        <title>Recent Critical Security Alerts (MITRE ATT&amp;CK Tagged)</title>
+        <search>
+          <query>
+            index=aws_cloudtrail 
+            | eval technique=case(
+                eventName=="ConsoleLogin" AND like(_raw, "%Failed authentication%"), "T1110 - Brute Force",
+                eventName=="ConsoleLogin" AND 'userIdentity.type'=="Root", "T1078 - Valid Accounts (Root)",
+                eventName IN ("AttachUserPolicy", "PutUserPolicy"), "T1098 - Account Manipulation",
+                true(), "General Audit"
+              )
+            | where technique!="General Audit"
+            | table _time, eventName, userIdentity.arn, sourceIPAddress, technique
+            | sort - _time
+          </query>
+          <earliest>-24h@h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="count">10</option>
+      </table>
+    </panel>
+  </row>
+</dashboard>
