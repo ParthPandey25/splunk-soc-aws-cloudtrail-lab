@@ -1,11 +1,11 @@
 <dashboard version="1.1" theme="dark">
-  <label>Cloud SOC Analyst Incident Monitoring Dashboard</label>
-  <description>Real-time threat detection for AWS CloudTrail &amp; VPC Flow Logs mapped to MITRE ATT&amp;CK</description>
+  <label>Cloud SOC Analyst Incident Monitoring &amp; Threat Detection Dashboard</label>
+  <description>Production SOC Monitoring: AWS CloudTrail &amp; VPC Flow Logs aligned to MITRE ATT&amp;CK Framework</description>
   
   <row>
     <panel>
       <single>
-        <title>Failed Console Logins (Last 24h)</title>
+        <title>Failed Console Logins (T1110)</title>
         <search>
           <query>index=aws_cloudtrail eventName=ConsoleLogin "errorMessage=Failed authentication" | stats count</query>
           <earliest>-24h@h</earliest>
@@ -19,9 +19,9 @@
     </panel>
     <panel>
       <single>
-        <title>Root Account Logins Without MFA</title>
+        <title>Root Logins Without MFA (T1078)</title>
         <search>
-          <query>index=aws_cloudtrail eventName=ConsoleLogin "responseElements.ConsoleLogin=Success" 'userIdentity.type'="Root" | stats count</query>
+          <query>index=aws_cloudtrail eventName=ConsoleLogin "responseElements.ConsoleLogin=Success" ('userIdentity.type'="Root" OR 'additionalEventData.MFAUsed'="No") | stats count</query>
           <earliest>-24h@h</earliest>
           <latest>now</latest>
         </search>
@@ -33,9 +33,23 @@
     </panel>
     <panel>
       <single>
-        <title>Privilege Escalation Events</title>
+        <title>Privilege Escalations (T1098)</title>
         <search>
-          <query>index=aws_cloudtrail eventName IN ("AttachUserPolicy", "AttachRolePolicy") requestParameters.policyArn="*AdministratorAccess*" | stats count</query>
+          <query>index=aws_cloudtrail eventName IN ("AttachUserPolicy", "AttachRolePolicy", "PutUserPolicy") requestParameters.policyArn="*AdministratorAccess*" | stats count</query>
+          <earliest>-24h@h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="rangeValues">[1]</option>
+        <option name="useColors">1</option>
+      </single>
+    </panel>
+    <panel>
+      <single>
+        <title>Defense Evasion / Log Tampering (T1562)</title>
+        <search>
+          <query>index=aws_cloudtrail eventName IN ("StopLogging", "DeleteTrail", "DeleteLogGroup", "DeleteBucketPublicAccessBlock") | stats count</query>
           <earliest>-24h@h</earliest>
           <latest>now</latest>
         </search>
@@ -49,8 +63,8 @@
 
   <row>
     <panel>
-      <table>
-        <title>Recent Critical Security Alerts (MITRE ATT&amp;CK Tagged)</title>
+      <chart>
+        <title>Alert Distribution by MITRE ATT&amp;CK Technique</title>
         <search>
           <query>
             index=aws_cloudtrail 
@@ -58,10 +72,33 @@
                 eventName=="ConsoleLogin" AND like(_raw, "%Failed authentication%"), "T1110 - Brute Force",
                 eventName=="ConsoleLogin" AND 'userIdentity.type'=="Root", "T1078 - Valid Accounts (Root)",
                 eventName IN ("AttachUserPolicy", "PutUserPolicy"), "T1098 - Account Manipulation",
-                true(), "General Audit"
+                eventName IN ("StopLogging", "DeleteTrail"), "T1562 - Impair Defenses",
+                eventName IN ("DeleteBucketPublicAccessBlock", "PutBucketAcl"), "T1530 - S3 Discovery/Exposure",
+                eventName=="AuthorizeSecurityGroupIngress", "T1021 - Remote Services Exposure",
+                true(), "Other Telemetry"
               )
-            | where technique!="General Audit"
-            | table _time, eventName, userIdentity.arn, sourceIPAddress, technique
+            | where technique!="Other Telemetry"
+            | stats count by technique
+          </query>
+          <earliest>-24h@h</earliest>
+          <latest>now</latest>
+        </search>
+        <option name="charting.chart">pie</option>
+        <option name="charting.chart.showPercent">1</option>
+      </chart>
+    </panel>
+    <panel>
+      <table>
+        <title>Live Security Incident Alert Queue (Prioritized)</title>
+        <search>
+          <query>
+            index=aws_cloudtrail 
+            | eval severity=case(
+                eventName=="StopLogging" OR ('userIdentity.type'=="Root" AND eventName=="ConsoleLogin"), "CRITICAL",
+                eventName IN ("AttachUserPolicy", "DeleteBucketPublicAccessBlock", "AuthorizeSecurityGroupIngress"), "HIGH",
+                true(), "MEDIUM"
+              )
+            | table _time, severity, eventName, userIdentity.arn, sourceIPAddress, awsRegion
             | sort - _time
           </query>
           <earliest>-24h@h</earliest>

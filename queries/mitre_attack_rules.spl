@@ -1,55 +1,134 @@
 # ==============================================================================
 # Splunk Enterprise SOC Detection Rules — AWS CloudTrail & VPC Flow Logs
-# Mapped to MITRE ATT&CK Framework
+# Production-Grade Threat Detection Engineering Mapped to MITRE ATT&CK Framework
 # Author: Parth Pandey (@ParthPandey25)
+# Focus: Cloud Security Monitoring, Detection Engineering, Incident Response
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
 # 1. T1110 - Brute Force / Excessive Console Login Failures
-# Description: Detects multiple failed AWS Console login attempts from a single IP.
+# Severity: HIGH | Data Source: aws_cloudtrail (ConsoleLogin)
+# Description: Detects credential stuffing or password brute-force bursts (>=5 failures in 5m).
 # ------------------------------------------------------------------------------
 index=aws_cloudtrail eventName=ConsoleLogin "errorMessage=Failed authentication"
 | bin _time span=5m
 | stats count as failed_attempts, values(userIdentity.userName) as targeted_users, values(userAgent) as user_agents by sourceIPAddress, _time
 | where failed_attempts >= 5
-| eval alert_severity="HIGH", mitre_technique="T1110 - Brute Force"
+| eval alert_severity="HIGH", mitre_technique="T1110 - Brute Force", detection_rule="CR-01: Console Brute Force"
 | sort - failed_attempts
 
 # ------------------------------------------------------------------------------
-# 2. T1078 - Valid Accounts / Unauthorized Console Login Without MFA
-# Description: Flags successful console logins using root or admin without MFA token.
+# 2. T1078 - Valid Accounts / Root Login Without Multi-Factor Authentication
+# Severity: CRITICAL | Data Source: aws_cloudtrail (ConsoleLogin)
+# Description: Flags any interactive root account console login, especially without MFA.
 # ------------------------------------------------------------------------------
 index=aws_cloudtrail eventName=ConsoleLogin "responseElements.ConsoleLogin=Success"
 | where 'additionalEventData.MFAUsed'="No" OR 'userIdentity.type'="Root"
 | table _time, userIdentity.type, userIdentity.arn, sourceIPAddress, awsRegion, additionalEventData.MFAUsed
 | eval alert_severity=if('userIdentity.type'=="Root", "CRITICAL", "MEDIUM")
-| eval mitre_technique="T1078 - Valid Accounts"
+| eval mitre_technique="T1078 - Valid Accounts", detection_rule="CR-02: Root/Non-MFA Console Access"
 
 # ------------------------------------------------------------------------------
-# 3. T1098 - Account Manipulation / IAM Policy Modification
-# Description: Detects creation or attachment of permissive administrator policies.
+# 3. T1098 - Account Manipulation / IAM Privilege Escalation via AdministratorAccess
+# Severity: CRITICAL | Data Source: aws_cloudtrail (IAM API)
+# Description: Detects immediate policy attachments granting full admin rights (*:*).
 # ------------------------------------------------------------------------------
 index=aws_cloudtrail eventName IN ("AttachUserPolicy", "AttachRolePolicy", "PutUserPolicy", "PutRolePolicy", "CreatePolicyVersion")
 | search requestParameters.policyArn="*AdministratorAccess*" OR requestParameters.policyDocument="*\"Action\": \"*\"*"
 | table _time, userIdentity.arn, eventName, requestParameters.userName, requestParameters.roleName, requestParameters.policyArn, sourceIPAddress
-| eval alert_severity="CRITICAL", mitre_technique="T1098 - Account Manipulation"
+| eval alert_severity="CRITICAL", mitre_technique="T1098 - Account Manipulation", detection_rule="CR-03: IAM Admin Escalation"
 
 # ------------------------------------------------------------------------------
 # 4. T1530 - Data from Cloud Storage Object / S3 Public Exposure Alert
-# Description: Alerts on S3 bucket ACL or policy changes granting public read/write.
+# Severity: HIGH | Data Source: aws_cloudtrail (S3 API)
+# Description: Alerts on modification of S3 bucket policies/ACLs removing Public Access Blocks.
 # ------------------------------------------------------------------------------
 index=aws_cloudtrail eventName IN ("PutBucketAcl", "PutBucketPolicy", "PutBucketPublicAccessBlock", "DeleteBucketPublicAccessBlock")
-| search requestParameters.PublicAccessBlockConfiguration.BlockPublicAcls=false OR requestParameters.PublicAccessBlockConfiguration.BlockPublicPolicy=false
+| search requestParameters.PublicAccessBlockConfiguration.BlockPublicAcls=false 
+      OR requestParameters.PublicAccessBlockConfiguration.BlockPublicPolicy=false
+      OR eventName="DeleteBucketPublicAccessBlock"
 | table _time, userIdentity.principalId, eventName, requestParameters.bucketName, sourceIPAddress, userAgent
-| eval alert_severity="HIGH", mitre_technique="T1530 - Cloud Storage Discovery"
+| eval alert_severity="HIGH", mitre_technique="T1530 - Cloud Storage Discovery", detection_rule="CR-04: S3 Public Exposure"
 
 # ------------------------------------------------------------------------------
-# 5. T1046 - Network Service Scanning / Port Scan Detection via VPC Flow Logs
-# Description: Identifies single source IP communicating with >25 unique destination ports.
+# 5. T1046 - Network Service Scanning / Port Sweep Detection via VPC Flow Logs
+# Severity: MEDIUM | Data Source: aws_vpc_flow
+# Description: Identifies single external/internal IP probing >=25 unique destination ports.
 # ------------------------------------------------------------------------------
 index=aws_vpc_flow action=REJECT
 | bin _time span=10m
 | stats dc(dest_port) as distinct_ports, count as reject_count by src_ip, dest_ip, _time
 | where distinct_ports >= 25
-| eval alert_severity="MEDIUM", mitre_technique="T1046 - Network Service Scanning"
+| eval alert_severity="MEDIUM", mitre_technique="T1046 - Network Service Scanning", detection_rule="CR-05: Network Port Sweep"
 | sort - distinct_ports
+
+# ------------------------------------------------------------------------------
+# 6. T1136.003 - Cloud Account Creation / Unauthorized IAM User & Access Key Spawning
+# Severity: HIGH | Data Source: aws_cloudtrail (IAM API)
+# Description: Detects rogue backdoor account creation or programmatic access key generation.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("CreateUser", "CreateAccessKey", "CreateLoginProfile")
+| table _time, userIdentity.arn, eventName, requestParameters.userName, responseElements.accessKey.accessKeyId, sourceIPAddress, userAgent
+| eval alert_severity="HIGH", mitre_technique="T1136.003 - Create Cloud Account", detection_rule="CR-06: Backdoor IAM Entity Created"
+
+# ------------------------------------------------------------------------------
+# 7. T1562.001 - Impair Defenses / Defense Evasion via CloudTrail Logging Termination
+# Severity: CRITICAL | Data Source: aws_cloudtrail (CloudTrail / GuardDuty API)
+# Description: Detects attempts to blind security defenders by stopping audit log trails.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("StopLogging", "DeleteTrail", "UpdateTrail", "DeleteDetector", "DisassociateFromMasterAccount")
+| table _time, userIdentity.arn, eventName, requestParameters.name, requestParameters.detectorId, sourceIPAddress, awsRegion
+| eval alert_severity="CRITICAL", mitre_technique="T1562.001 - Impair Defenses: Disable Cloud Logs", detection_rule="CR-07: Log Tampering Attempt"
+
+# ------------------------------------------------------------------------------
+# 8. T1021.002 / T1562 - Ingress Exposure / Remote Management Port Opened to 0.0.0.0/0
+# Severity: HIGH | Data Source: aws_cloudtrail (EC2 Security Groups API)
+# Description: Detects inbound Security Group rules permitting SSH (22) or RDP (3389) from anywhere.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("AuthorizeSecurityGroupIngress", "ModifySecurityGroupRules")
+| spath path=requestParameters.ipPermissions.items{} output=permissions
+| mvexpand permissions
+| spath input=permissions
+| search (fromPort=22 OR toPort=22 OR fromPort=3389 OR toPort=3389) AND ipRanges.items{}.cidrIp="0.0.0.0/0"
+| table _time, userIdentity.arn, requestParameters.groupId, fromPort, toPort, sourceIPAddress
+| eval alert_severity="HIGH", mitre_technique="T1021 - Remote Services: Exposed Management Port", detection_rule="CR-08: Global Management Ingress"
+
+# ------------------------------------------------------------------------------
+# 9. T1070.004 - Indicator Removal / Deletion of CloudWatch Log Streams or S3 Access Logs
+# Severity: HIGH | Data Source: aws_cloudtrail (Logs / S3 API)
+# Description: Detects forensic footprint eradication through log deletion or retention reduction.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("DeleteLogGroup", "DeleteLogStream", "PutRetentionPolicy")
+| search eventName="DeleteLogGroup" OR (eventName="PutRetentionPolicy" AND requestParameters.retentionInDays < 30)
+| table _time, userIdentity.arn, eventName, requestParameters.logGroupName, sourceIPAddress
+| eval alert_severity="HIGH", mitre_technique="T1070.004 - File Deletion: Erase Audit Trail", detection_rule="CR-09: Log Retention Tampering"
+
+# ------------------------------------------------------------------------------
+# 10. T1087.004 - Account Discovery / High-Frequency IAM Enumeration Burst
+# Severity: MEDIUM | Data Source: aws_cloudtrail (IAM Reconnaissance)
+# Description: Flags burst discovery activity (>10 read-only discovery queries in 2 minutes).
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("GetAccountSummary", "ListUsers", "ListRoles", "ListPolicies", "GetAccountAuthorizationDetails")
+| bin _time span=2m
+| stats count as discovery_calls, values(eventName) as called_apis by userIdentity.arn, sourceIPAddress, _time
+| where discovery_calls >= 10
+| eval alert_severity="MEDIUM", mitre_technique="T1087.004 - Cloud Account Discovery", detection_rule="CR-10: IAM Reconnaissance Spike"
+
+# ------------------------------------------------------------------------------
+# 11. T1528 - Steal Application Access Token / Anomalous STS AssumeRole from Public ASN
+# Severity: HIGH | Data Source: aws_cloudtrail (STS API)
+# Description: Detects cross-account STS token generation from non-corporate / residential IP spaces.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName="AssumeRole" "responseElements.credentials.accessKeyId"=ASIA*
+| where NOT cidrmatch("10.0.0.0/8", sourceIPAddress) AND NOT cidrmatch("172.16.0.0/12", sourceIPAddress) AND NOT cidrmatch("192.168.0.0/16", sourceIPAddress)
+| table _time, userIdentity.arn, requestParameters.roleArn, requestParameters.roleSessionName, sourceIPAddress, userAgent
+| eval alert_severity="HIGH", mitre_technique="T1528 - Steal Application Access Token", detection_rule="CR-11: Untrusted STS AssumeRole"
+
+# ------------------------------------------------------------------------------
+# 12. T1059.009 - Cloud Administration Command / SSM RunCommand or CloudShell Abuse
+# Severity: HIGH | Data Source: aws_cloudtrail (SSM / CloudShell API)
+# Description: Detects remote command execution on EC2 fleet or interactive CloudShell usage.
+# ------------------------------------------------------------------------------
+index=aws_cloudtrail eventName IN ("SendCommand", "CreateEnvironment", "StartSession")
+| table _time, userIdentity.arn, eventName, requestParameters.documentName, requestParameters.instanceIds.items{}, sourceIPAddress, awsRegion
+| eval alert_severity="HIGH", mitre_technique="T1059.009 - Cloud Command Execution", detection_rule="CR-12: Remote SSM/CloudShell Execution"
